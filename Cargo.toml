@@ -1,0 +1,35 @@
+[package]
+name = "jerry-ai-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 1. 异步运行时（类似 JVM 底层线程池 + NIO 事件循环）
+tokio = { version = "1", features = ["full"] }
+
+# 2. 现代 Web 框架（基于 Tokio 和 Hyper，设计理念极其优雅，类似精简版 Spring Web）
+axum = "0.8"
+
+# 3. 异步 HTTP 客户端（用于向上游大模型 API 发起转发请求，自带连接池）
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+
+# 4. 序列化与反序列化（类似 Jackson，零反射编译期生成代码）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 5. 结构化日志追踪（类似 SLF4J + Logback）
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# 6. 环境变量加载器（自动读取项目根目录的 .env 文件）
+dotenvy = "0.15"
+
+# 7. 工业级派生错误宏（自动生成 std::error::Error 和 From 转换）
+thiserror = "2"
+
+# 8. 高性能异步限流器（基于令牌桶/漏桶算法）
+governor = "0.10.4"
+
+# 9. 异步流处理神器（极简实现透明流拦截）
+async-stream = "0.3"
+futures-util = "0.3"
