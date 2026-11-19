@@ -116,11 +116,3 @@ curl -N -X POST "[http://127.0.0.1:3000/v1/chat/completions](http://127.0.0.1:30
 * **PowerShell**：直接用 `curl.exe -d "{...}"` 传递 JSON 和中文极易触发引号转义错误或编码乱码。建议改用 ApiPost/Postman，或使用 Git Bash。
 * **Git Bash**：若直接粘贴含中文的命令行参数报 `invalid unicode code point`，请将 JSON 写入 UTF-8 编码的 `request.json` 文件，并通过 `curl -N ... -d @request.json` 发送。
 * **API 调试工具（ApiPost / Postman）**：部分版本默认会对响应做缓冲或单行渲染，若想直观查看逐字输出的打字机节奏，建议使用 `curl -N`（禁用缓冲）进行验证。
-
-
-
-```
-
-顺便提醒一下，如果准备推到 GitHub 开源，记得在项目根目录检查一下 `.gitignore` 里有没有加上 `.env` 和 `request.json`（刚才测试生成的临时文件），避免不小心把测试文件或密钥一并提交上去。需要我顺手帮你生成一份 `.env.example` 或完善一下项目架构图吗？
-
-```
