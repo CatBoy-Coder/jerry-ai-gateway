@@ -1,56 +1,158 @@
 mod config;
 mod error;
+mod ir;
 mod middleware;
+mod provider;
 
 use axum::{
     body::Body,
     extract::State,
     http::{header, HeaderValue, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use config::AppConfig;
+use config::{AppConfig, ProviderConfig};
 use error::GatewayError;
+use futures_util::StreamExt;
 use governor::{Quota, RateLimiter};
+use ir::{format_openai_sse_chunk, TokenUsage, UnifiedRequest, UnifiedStreamEvent};
+use provider::{gemini::GeminiProvider, openai::OpenAiProvider, LlmProvider};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Instant};
 use std::num::NonZeroU32;
-use axum::response::Response;
-use tracing::info;
-use futures_util::StreamExt;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tracing::{error, info, warn};
+
+/// 上游首字节响应超时时间（超时则触发自动降级）
+const UPSTREAM_TTFB_TIMEOUT_SECS: u64 = 15;
+
+/// 运行时通道实例（配置 + 协议适配器）
+#[derive(Clone)]
+pub struct ProviderEntry {
+    pub config: ProviderConfig,
+    pub adapter: Arc<dyn LlmProvider>,
+}
 
 pub struct AppState {
     pub http_client: Client,
     pub config: AppConfig,
-    // 全局限流器实例：由于基于内部原子操作，无需套 Mutex
     pub rate_limiter: governor::DefaultDirectRateLimiter,
+    /// 按 .env 从上至下顺序加载的通道列表
+    pub providers: Vec<ProviderEntry>,
+}
+
+impl AppState {
+    /// 根据请求的模型名称，动态构建本次请求的降级候选链路
+    pub fn build_fallback_chain(
+        &self,
+        requested_model: &str,
+    ) -> Result<Vec<(String, ProviderEntry)>, GatewayError> {
+        let mut chain: Vec<(String, ProviderEntry)> = Vec::new();
+        let mut used_ids: Vec<String> = Vec::new();
+
+        // 1. 若客户端指定了具体模型（非 auto），优先匹配对应前缀或默认模型的通道放第一位
+        if requested_model != "auto" {
+            let matched = self.providers.iter().find(|entry| {
+                entry.config.default_model == requested_model
+                    || entry
+                    .config
+                    .model_prefix
+                    .as_deref()
+                    .map(|p| requested_model.starts_with(p))
+                    .unwrap_or(false)
+            });
+
+            if let Some(entry) = matched {
+                used_ids.push(entry.config.id.clone());
+                chain.push((requested_model.to_string(), entry.clone()));
+            } else if let Some(primary) = self.providers.first() {
+                // 未匹配到特定前缀时，交给顺位 1 的默认通道尝试
+                used_ids.push(primary.config.id.clone());
+                chain.push((requested_model.to_string(), primary.clone()));
+            }
+        }
+
+        // 2. 严格按 .env 从上至下的顺序追加剩余通道作为降级备胎
+        for entry in &self.providers {
+            if !used_ids.contains(&entry.config.id) {
+                used_ids.push(entry.config.id.clone());
+                chain.push((entry.config.default_model.clone(), entry.clone()));
+            }
+        }
+
+        if chain.is_empty() {
+            return Err(GatewayError::InternalError(
+                "网关未配置任何可用的上游模型通道".to_string(),
+            ));
+        }
+
+        Ok(chain)
+    }
+}
+
+/// 根据协议类型实例化对应的适配器
+fn build_adapter(cfg: &ProviderConfig) -> Arc<dyn LlmProvider> {
+    match cfg.protocol.as_str() {
+        "gemini" => Arc::new(GeminiProvider::new(
+            cfg.api_key.clone(),
+            cfg.base_url.clone(),
+        )),
+        _ => Arc::new(OpenAiProvider::new(
+            cfg.api_key.clone(),
+            cfg.base_url.clone(),
+        )),
+    }
+}
+
+/// 判断上游 HTTP 状态码是否适合触发自动降级
+fn should_fallback(status: reqwest::StatusCode) -> bool {
+    let code = status.as_u16();
+    // 401(Key失效) / 402(欠费) / 403(额度耗尽) / 404(端点或模型不存在) / 429(限流) / 5xx(服务端异常)
+    matches!(code, 401 | 402 | 403 | 404 | 429) || status.is_server_error()
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // 1. 从环境变量/.env 加载强类型配置
     let config = AppConfig::from_env();
     let bind_addr = format!("0.0.0.0:{}", config.port);
 
-    // 配置限流额度（基于配置文件，每秒补充 N 个 Token，桶最大容量也是 N）
     let quota = Quota::per_second(NonZeroU32::new(config.rate_limit_per_sec as u32).unwrap());
     let rate_limiter = RateLimiter::direct(quota);
+
+    let providers: Vec<ProviderEntry> = config
+        .providers
+        .iter()
+        .map(|cfg| ProviderEntry {
+            config: cfg.clone(),
+            adapter: build_adapter(cfg),
+        })
+        .collect();
+
+    let chain_desc: Vec<String> = providers
+        .iter()
+        .map(|p| format!("{}({})", p.config.id, p.config.default_model))
+        .collect();
+
+    info!(
+        "🛡️ 动态降级链路已就绪 (按 .env 顺序): {}",
+        chain_desc.join(" -> ")
+    );
 
     let shared_state = Arc::new(AppState {
         http_client: Client::new(),
         config,
         rate_limiter,
+        providers,
     });
 
-    // 注意：Axum 中间件的执行顺序是自底向上（倒序）的！
-    // 所以先通过 auth_middleware，再通过 rate_limit_middleware
     let app = Router::new()
         .route("/health", get(health_check))
-        // 只有 /v1/chat/completions 需要被鉴权和限流保护
         .route(
             "/v1/chat/completions",
             post(proxy_chat_completions)
@@ -65,7 +167,10 @@ async fn main() {
         )
         .with_state(shared_state);
 
-    info!("🚀 jerry-ai-gateway v0.2.0 启动成功！监听地址: http://{}", bind_addr);
+    info!(
+        "🚀 jerry-ai-gateway v0.5.0 启动成功！监听地址: http://{}",
+        bind_addr
+    );
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -75,118 +180,201 @@ async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "UP",
         "gateway": "jerry-ai-gateway",
-        "version": "0.2.0"
+        "version": "0.5.0"
     }))
 }
 
-// 将返回值类型改为 Result<Response, GatewayError>，以便统一下发 JSON 或 Stream
 async fn proxy_chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> Result<Response, GatewayError> {
     let start_time = Instant::now();
 
-    // 1. 提取核心参数
-    let model_name = payload
-        .get("model")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| GatewayError::BadRequest("缺少必填字段: model".to_string()))?
-        .to_string();
+    // 1. 入站翻译：解析为网关独立的 UnifiedRequest
+    let base_req = UnifiedRequest::from_openai_json(&payload)?;
 
-    // 嗅探客户端是否请求了流式输出 (默认为 false)
-    let is_stream = payload
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // 2. 构建动态降级候选链路
+    let candidates = state.build_fallback_chain(&base_req.model)?;
+    let total_candidates = candidates.len();
 
-    // 核心补丁：如果前端请求的是流式，网关强行注入 include_usage 参数
-    if is_stream {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "stream_options".to_string(),
-                json!({"include_usage": true})
-            );
+    let mut active_response: Option<reqwest::Response> = None;
+    let mut active_entry: Option<ProviderEntry> = None;
+    let mut active_model = String::new();
+    let mut last_error: Option<GatewayError> = None;
+
+    // 3. 依次尝试候选通道，触发可重试异常时自动降级
+    for (idx, (target_model, entry)) in candidates.into_iter().enumerate() {
+        let mut req_for_candidate = base_req.clone();
+        req_for_candidate.model = target_model.clone();
+
+        info!(
+            ">>> 发起推理请求 ({}/{}) | 通道: {} [{}] | 目标模型: {} | 流式: {}",
+            idx + 1,
+            total_candidates,
+            entry.config.id,
+            entry.adapter.name(),
+            target_model,
+            req_for_candidate.stream
+        );
+
+        let request_builder = entry
+            .adapter
+            .build_request(&state.http_client, &req_for_candidate)?;
+
+        let send_result = tokio::time::timeout(
+            Duration::from_secs(UPSTREAM_TTFB_TIMEOUT_SECS),
+            request_builder.send(),
+        )
+            .await;
+
+        match send_result {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() {
+                    active_response = Some(resp);
+                    active_entry = Some(entry);
+                    active_model = target_model;
+                    break;
+                }
+
+                let axum_status = StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let resp_body: Value = resp.json().await.unwrap_or_default();
+                let err = GatewayError::UpstreamApiError(axum_status, resp_body);
+
+                if should_fallback(status) && idx + 1 < total_candidates {
+                    warn!(
+                        "⚠️ 通道 {} (模型: {}) 返回 HTTP {}，触发自动降级至下一顺位！",
+                        entry.config.id,
+                        target_model,
+                        status.as_u16()
+                    );
+                    last_error = Some(err);
+                    continue;
+                } else {
+                    error!(
+                        "❌ 通道 {} (模型: {}) 返回不可降级错误 HTTP {}，直接终止请求",
+                        entry.config.id,
+                        target_model,
+                        status.as_u16()
+                    );
+                    return Err(err);
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "⚠️ 通道 {} (模型: {}) 网络请求失败: {}，准备降级...",
+                    entry.config.id, target_model, e
+                );
+                last_error = Some(GatewayError::from(e));
+                continue;
+            }
+            Err(_) => {
+                warn!(
+                    "⚠️ 通道 {} (模型: {}) 首字节响应超过 {}s 超时，触发自动降级！",
+                    entry.config.id, target_model, UPSTREAM_TTFB_TIMEOUT_SECS
+                );
+                last_error = Some(GatewayError::InternalError(format!(
+                    "上游模型 {} 响应超时",
+                    target_model
+                )));
+                continue;
+            }
         }
     }
 
-    info!(">>> 收到推理请求 | 目标模型: {} | 流式: {}", model_name, is_stream);
+    let response = match active_response {
+        Some(r) => r,
+        None => {
+            return Err(last_error.unwrap_or_else(|| {
+                GatewayError::InternalError("所有上游模型通道均不可用".to_string())
+            }));
+        }
+    };
 
-    // 3. 向上游发起请求
-    let response = state
-        .http_client
-        .post(&state.config.upstream_url)
-        .bearer_auth(&state.config.dashscope_api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
+    let entry = active_entry.unwrap();
+    let provider_id = entry.config.id.clone();
+    let provider = entry.adapter.clone();
     let status = response.status();
 
-    // 如果上游报错，直接原样抛出
-    if !status.is_success() {
-        let axum_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let resp_body: Value = response.json().await.unwrap_or_default();
-        return Err(GatewayError::UpstreamApiError(axum_status, resp_body));
-    }
-
-    // 🌟 4. 双轨分发：流式 (SSE) vs 非流式 (JSON)
-    if is_stream {
-        // 拿到上游的原始字节流
+    // 4. 双轨响应处理（统一翻译回 OpenAI 协议）
+    if base_req.stream {
         let mut upstream_stream = response.bytes_stream();
+        let stream_model = active_model.clone();
+        let stream_provider = provider.clone();
+        let stream_provider_id = provider_id.clone();
 
-        // 🌟 修复核心：克隆一份所有权给即将"远行"的后台异步流
-        let stream_model_name = model_name.clone();
-
-        // 🌟 核心魔法：使用 async_stream 开启一个透明的旁路拦截器
         let stream_body = async_stream::stream! {
-            let mut final_usage = None;
+            let mut line_buf: Vec<u8> = Vec::new();
+            let mut final_usage = TokenUsage::default();
+            let mut sent_done = false;
             let stream_start = Instant::now();
 
-            // 逐个截获流经此处的字节块 (Chunk)
             while let Some(chunk_result) = upstream_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
-                        // 1. 旁路嗅探：尝试把字节转成字符串，看看有没有 Token 消耗数据
-                        if let Ok(text) = std::str::from_utf8(&bytes) {
-                            for line in text.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
-                                    if data != "[DONE]" {
-                                        // 嗅探 JSON 里的 usage 字段 (百炼大模型通常在最后几个 Chunk 附带完整 usage)
-                                        if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                            if let Some(usage) = json.get("usage") {
-                                                if !usage.is_null() {
-                                                    final_usage = Some(usage.clone());
-                                                }
-                                            }
+                        line_buf.extend_from_slice(&bytes);
+
+                        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            for event in stream_provider.parse_stream_line(&line) {
+                                match event {
+                                    UnifiedStreamEvent::ContentDelta(text) => {
+                                        let sse = format_openai_sse_chunk(&stream_model, &text);
+                                        yield Ok::<_, reqwest::Error>(sse);
+                                    }
+                                    UnifiedStreamEvent::Usage(u) => {
+                                        if u.prompt_tokens > 0 {
+                                            final_usage.prompt_tokens = u.prompt_tokens;
+                                        }
+                                        if u.completion_tokens > 0 {
+                                            final_usage.completion_tokens = u.completion_tokens;
+                                        }
+                                        final_usage.total_tokens = if u.total_tokens > 0 {
+                                            u.total_tokens
+                                        } else {
+                                            final_usage.prompt_tokens + final_usage.completion_tokens
+                                        };
+                                    }
+                                    UnifiedStreamEvent::Done => {
+                                        if !sent_done {
+                                            sent_done = true;
+                                            yield Ok::<_, reqwest::Error>("data: [DONE]\n\n".to_string());
                                         }
                                     }
                                 }
                             }
                         }
-
-                        // 2. 🌟 绝对零延迟：嗅探完立刻把原始字节原封不动地发给下游客户端！
-                        yield Ok::<_, reqwest::Error>(bytes);
                     }
                     Err(e) => yield Err(e),
                 }
             }
 
-            // --- 🌟 水管彻底关闭，流式传输结束，触发结账 ---
+            if !sent_done {
+                yield Ok::<_, reqwest::Error>("data: [DONE]\n\n".to_string());
+            }
+
             let elapsed = stream_start.elapsed().as_millis();
-            if let Some(usage) = final_usage {
-                let total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                // 🌟 修改点：这里使用被 Move 进来的克隆体 stream_model_name
+            if final_usage.total_tokens > 0 {
                 tracing::info!(
-                    "<<< [流式审计入账] 模型: {} | 持续输出耗时: {} ms | 共消耗 Token: {} 💰",
-                    stream_model_name, elapsed, total_tokens
+                    "<<< [流式审计入账] 通道: {} | 模型: {} | 耗时: {} ms | Token: {} (输入 {} / 输出 {}) 💰",
+                    stream_provider_id,
+                    stream_model,
+                    elapsed,
+                    final_usage.total_tokens,
+                    final_usage.prompt_tokens,
+                    final_usage.completion_tokens
                 );
-                // 💡 未来可在此处使用 tokio::spawn 开启独立的异步任务，把 total_tokens 写入 MySQL/Redis 进行扣费，绝不阻塞！
             } else {
-                tracing::warn!("<<< [流式审计] 未能从流中提取到 Token 消耗数据 (可能是上游异常中断)");
+                tracing::warn!("<<< [流式审计] 通道: {} 未提取到 Token 统计", stream_provider_id);
             }
         };
 
-        // 将包装了“透明水表”的流，塞回给 Axum
         let mut res = Response::new(Body::from_stream(stream_body));
         *res.status_mut() = status;
         res.headers_mut().insert(
@@ -198,26 +386,32 @@ async fn proxy_chat_completions(
             HeaderValue::from_static("no-cache"),
         );
 
-        info!("<<< 流式通道已建立并挂载审计水表 | 模型: {} | TTFB: {} ms", model_name, start_time.elapsed().as_millis());
+        info!(
+            "<<< 流式通道已建立 | 通道: {} | 模型: {} | TTFB: {} ms",
+            provider_id,
+            active_model,
+            start_time.elapsed().as_millis()
+        );
         Ok(res)
     } else {
-        // 【非流式处理】(保持之前的逻辑)
-        let resp_body: Value = response.json().await?;
-        let total_tokens = resp_body
-            .pointer("/usage/total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let raw_body: Value = response.json().await?;
+        let (openai_body, usage) = provider.parse_response(raw_body, &active_model)?;
 
-        info!("<<< 非流式推理完成 | 模型: {} | 耗时: {} ms | 消耗 Token: {}",
-              model_name, start_time.elapsed().as_millis(), total_tokens);
+        info!(
+            "<<< 非流式推理完成 | 通道: {} | 模型: {} | 耗时: {} ms | Token: {} (输入 {} / 输出 {})",
+            provider_id,
+            active_model,
+            start_time.elapsed().as_millis(),
+            usage.total_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens
+        );
 
-        // 手动构造带有 UTF-8 的 JSON 响应
-        let mut res = Json(resp_body).into_response();
+        let mut res = Json(openai_body).into_response();
         res.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json; charset=utf-8"),
         );
-
         Ok(res)
     }
 }

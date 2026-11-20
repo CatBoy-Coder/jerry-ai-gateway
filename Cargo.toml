@@ -33,3 +33,6 @@ governor = "0.10.4"
 # 9. 异步流处理神器（极简实现透明流拦截）
 async-stream = "0.3"
 futures-util = "0.3"
+
+# 10. 支持 Arc<dyn LlmProvider> 动态分发
+async-trait = "0.1"

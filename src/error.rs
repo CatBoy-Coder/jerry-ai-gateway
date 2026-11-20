@@ -18,6 +18,9 @@ pub enum GatewayError {
 
     #[error("请求参数缺失或非法: {0}")]
     BadRequest(String),
+
+    #[error("网关内部错误: {0}")]
+    InternalError(String),
 }
 
 // 实现 Axum 的 IntoResponse Trait
@@ -48,6 +51,15 @@ impl IntoResponse for GatewayError {
                 }));
                 (StatusCode::BAD_REQUEST, body).into_response()
             }
+            GatewayError::InternalError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": msg,
+                        "type": "internal_error"
+                    }
+                })),
+            ).into_response(),
         }
     }
 }
